@@ -1,0 +1,88 @@
+#! /usr/bin/perl
+
+# This is the 'cron' bit of cronbutton; it's a script that you should run via Cron (ideally using 
+# a wrapper to make it safer, see the README), and that will actually execute the jobs queued up
+# in the todo table.
+#
+# You will need to set the database password, using the CRONBUTTON_DB_PW environment variable, and
+# if you're doing anything other than using the db 'cronbutton' uith the user 'cronbutton_runner' on
+# localhost, you'll have to edit the file I'm afraid.
+
+use DBI; # libdbd-mysql-perl
+use Modern::Perl;
+
+# These are the bits you might want to edit:
+my $db_user = 'cronbutton_runner';
+my $db_pass = $ENV{CRONBUTTON_DB_PW};
+my $db_name = 'cronbutton';
+my $db_host = 'localhost';
+my $db_port = 3306;
+
+# Not these.
+my $dsn = "DBI:mysql:database=$db_name;host=$db_host;port=$db_port";
+my $dbh = DBI->connect($dsn, $db_user, $db_pass);
+
+# First, get the todo list. If there's nothing to be done we'll just exit.
+my $sth = $dbh->prepare('select id, task_name from todo where completed is null and deleted is null order by submitted asc limit 1');
+$sth->execute() or abort("Failed to get task:".$dbh->errstr());
+my $todo = $sth->fetchrow_hashref();
+unless($todo){
+  debug("No todo tasks found; exiting");
+  exit 0;
+
+}
+my $task_name = $todo->{task_name};
+my $todo_id = $todo->{id};
+# Tell the DB that we've started as soon as possible. This isn't a remotely robust way of
+# preventing collisions, but we might as well _try_
+$sth = $dbh->prepare('update todo set started = current_timestamp where id = ?');
+$sth->execute($todo_id) or abort("Failed to update todo table with start time (id: $todo_id;): ".$dbh->errstr());
+
+# If we're here, there's a thing in the todo list, and so we get the command out of the DB
+$sth = $dbh->prepare('select command from tasks where name = ?');
+$sth->execute($task_name) or abort("Failed to get command for task '$task_name':".$dbh->errstr());
+my $task = $sth->fetchrow_hashref();
+my $command = $task->{command};
+
+# And then run that command:
+info("task name: $task_name; todo id: $todo_id; command: $command;");
+my @output = qx/$command/;
+my $retval = $?;
+info("returned: $retval;");
+info("Output:");
+foreach my $line (@output){
+  info($line);
+}
+
+# Having run, update the DB to say we're done, and then exit. Exit using the todo-command's exit 
+# status, since we might be being wrapped in something that cares about that.
+$sth = $dbh->prepare('update todo set completed = current_timestamp, exit_status = ? where id = ?');
+$sth->execute($retval, $todo_id) or abort("Failed to update todo table with status (exit_status: $retval, id: $todo_id): ".$dbh->errstr());
+info("Done");
+exit($retval);
+
+sub info{
+  my $message = shift;
+  chomp($message);
+  print "$message\n";
+}
+
+sub error{
+  my $message = shift;
+  chomp($message);
+  print STDERR "ERROR: $message\n";
+}
+
+sub debug{
+  return unless $ENV{DEBUG};
+  my $message = shift;
+  chomp($message);
+  print STDERR "DEBUG: $message\n";
+}
+
+sub abort{
+  my $message = shift;
+  error($message);
+  error("Aborting");
+  exit 255;
+}
